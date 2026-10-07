@@ -444,7 +444,7 @@ fn authentication_failure_does_not_publish_a_replica() {
 
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("no saved Hyfa credential"));
-    assert!(!state.path().join("repositories").exists());
+    assert_failed_diagnostics_without_replica(&state, "authentication");
 }
 
 #[test]
@@ -528,7 +528,7 @@ fn rate_limit_failure_is_actionable_and_does_not_publish_a_replica() {
     assert!(stderr.contains("1786100000"));
     assert!(stderr.contains("60"));
     assert!(!stderr.contains("automation-token"));
-    assert!(!state.path().join("repositories").exists());
+    assert_failed_diagnostics_without_replica(&state, "rate_limited");
     events.assert();
     limited.assert();
     labels.assert();
@@ -559,7 +559,7 @@ fn interrupted_response_does_not_publish_a_replica() {
 
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("invalid JSON"));
-    assert!(!state.path().join("repositories").exists());
+    assert_failed_diagnostics_without_replica(&state, "invalid_response");
     events.assert();
     interrupted.assert();
     labels.assert();
@@ -589,6 +589,22 @@ fn sync_rejects_an_unsafe_api_base_before_authentication() {
         );
         assert!(!state.path().join("repositories").exists());
     }
+}
+
+fn assert_failed_diagnostics_without_replica(state: &TempDir, code: &str) {
+    assert!(!support::replica_path(state, "acme/widgets").exists());
+    let attempt: Value = serde_json::from_slice(
+        &fs::read(
+            state
+                .path()
+                .join("repositories/acme/widgets/sync-status.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(attempt["state"], "failed");
+    assert_eq!(attempt["failure"]["code"], code);
+    assert!(attempt["published_synced_at"].is_null());
 }
 
 fn mock_labels(

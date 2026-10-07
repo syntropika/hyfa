@@ -14,6 +14,11 @@ graphs. Start with the [README](../README.md) for a quick introduction and
 | Install agent usage instructions in this project | `hyfa skill install` |
 | List supported skill providers | `hyfa skill providers` |
 | Refresh the local snapshot | `hyfa sync --repo OWNER/REPO` |
+| Inspect local synchronization progress and failures | `hyfa status --repo OWNER/REPO` |
+| Search effective Issue content locally | `hyfa search --repo OWNER/REPO --query 'manifest cache'` |
+| Find related Issues with evidence | `hyfa related OWNER/REPO#42` |
+| Inspect linked closing PRs | `hyfa prs OWNER/REPO#42` |
+| Read an Issue with linked PR context | `hyfa view OWNER/REPO#42 --with-prs` |
 | List executable Issues | `hyfa ready --repo OWNER/REPO` |
 | Recommend the next Issue | `hyfa next --repo OWNER/REPO` |
 | Inspect parallel work and dependency layers | `hyfa plan --repo OWNER/REPO` |
@@ -23,8 +28,90 @@ graphs. Start with the [README](../README.md) for a quick introduction and
 | Apply pending changes | `hyfa reconcile --repo OWNER/REPO` |
 
 Most commands accept `--json`. Run `hyfa COMMAND --help` for all arguments.
-Read commands attempt a GitHub refresh and can use the last valid snapshot
-when offline. They never replay pending writes.
+Operational analysis and online Issue reading attempt a GitHub refresh and can
+use the last valid snapshot when offline. Discovery reads locally by default;
+`status` always reads locally. Read commands never replay pending writes.
+
+## Discover Issue content locally
+
+After an initial successful synchronization, search titles, bodies, and comments
+in the Working graph, including pending edits, comments, and Draft Issues:
+
+```bash
+hyfa search --repo OWNER/REPO --query 'manifest cache' --json
+hyfa search --repo OWNER/REPO --query 'manifest cache' --state open --label area:backend --assignee LOGIN
+hyfa related 'OWNER/REPO#42' --state all --limit 10 --json
+```
+
+These commands use no network or credentials by default. Pass `--refresh` to
+attempt a pull-only synchronization first, with the same valid-replica fallback
+as analysis. They require a valid Local replica. Inspect `synced_at`, `source`,
+`pending`, and ordered `pending_operation_ids` before relying on the results.
+Draft hits use their stable key and `temporary_id`, without a synthetic Issue
+number. Hit provenance describes the candidate's pending changes; `related`
+also exposes `subject_provenance` for evidence originating in its subject.
+
+Search uses `keyword/v1`: split the query into case-insensitive alphanumeric
+terms and require every distinct term somewhere in an Issue's effective title,
+body, or comments. This is token matching, without phrase operators, stemming,
+fuzzy matching, or embeddings. Order matches by the sum of distinct query terms
+per document, weighted 3 for the title, 2 for the body, and 1 per comment; use
+the Stable node key to break ties. This order is discovery relevance and never
+changes readiness, Declared priority, or `next/v1`.
+
+`related` uses `references-and-title-terms/v1`. Candidates have either an
+explicit reference in either direction or at least two shared informative title
+terms. Title terms have four or more characters and exclude common English
+boilerplate words. Recognized references are exact `#NUMBER`, `OWNER/REPO#NUMBER`,
+Draft keys, and the Issue's canonical URL, including ordinary Markdown links.
+References to another Repository and prefixes such as `#12` for `#1` do not
+match. Explicit references sort first, then the shared title-term count, then
+the Stable node key. These are related-work candidates, not confirmed
+duplicates or native Dependencies. A reference alone does not establish that
+one Issue blocks another.
+
+Both commands accept `--state open|closed|all` (default `all`), repeatable
+`--label` (require every label), `--assignee`, and `--limit` (1–100, default 20).
+Discovery may return closed or blocked Issues; use `ready` or `next` to choose
+executable work. Results report the total `matched_count` before limiting and
+an explicit `truncated` flag. Each hit has at most five evidence entries and
+180 characters per snippet, with `evidence_truncated` when more evidence exists.
+Comment evidence uses a zero-based index in the effective comment list.
+`subject_reference` evidence is located in the source Issue; other evidence
+is located in the candidate. Operation markers stay excluded from searchable
+content and snippets. JSON envelopes are `hyfa.search/v1` and `hyfa.related/v1`.
+
+## Inspect linked PR context
+
+```bash
+hyfa prs 'OWNER/REPO#42' --json
+hyfa prs 'OWNER/REPO#42' --offline --json
+hyfa view 'OWNER/REPO#42' --with-prs --json
+hyfa view 'OWNER/REPO#42' --with-prs --offline --json
+```
+
+`prs` observes GitHub's native closing PR references, including manually linked,
+open, closed, merged, and cross-Repository PRs visible to the current account.
+It is not a search for every textual PR mention. Context contains each PR's
+key, number, title, URL, state, Draft flag, update time, and merge time. PRs
+remain context for an Issue; they never become operational graph nodes or
+recommendations. Checks and reviews are not fetched in this initial contract.
+
+The command paginates the complete connection and validates its count,
+identities, and cursor continuity before atomically replacing a private cache
+separate from the Local replica. A failed refresh preserves previous context
+and its `observed_at`; `source: local_fallback` includes a sanitized `warning`.
+The observation time is independent of the Issue replica's `synced_at`.
+`complete` describes the saved observation, not a guarantee about current live
+state. Without a successful observation, `complete` is false and `pull_requests`
+is null; a complete empty observation has an empty array. Draft Issues have
+`source: draft` and no GitHub PR context until they receive a remote identity.
+
+`prs --offline` reads only cached context and does not require a Local replica.
+`view --with-prs` adds `pull_request_context` to its existing JSON envelope;
+ordinary `view` output retains its existing shape. Standalone context uses
+`hyfa.pull-requests/v1`. Bodies, comments, pending intent, PR caches, and
+synchronization diagnostics stay outside the sealed public graph export.
 
 ## Synchronize a Repository
 
@@ -40,6 +127,26 @@ hyfa sync --repo OWNER/REPO --json
 `--json` emits the versioned `hyfa.sync/v1` result envelope with Repository
 scope, `synced_at`, a deterministic input hash, and normalized entity counts.
 Neither output mode includes credentials or raw GitHub responses.
+
+Use `hyfa status --repo OWNER/REPO --json` to inspect the last reported
+synchronization attempt, the valid snapshot's counts and `synced_at`, and the
+pending-operation count without contacting GitHub. Status uses `hyfa.status/v1`.
+`snapshot_state` distinguishes a valid, missing, or invalid replica; invalid
+replicas have no snapshot summary and cannot become analysis input.
+Pull refreshes record `hyfa.sync-attempt/v1` diagnostics in a separate private
+sidecar, updating phases (`connecting`, `refreshing`, `validating`, `publishing`)
+and received-page activity through atomic replacement. Pages and items describe
+decoded REST collection activity, including labels and events, rather than
+committed Issues. Conditional 304 responses and GraphQL probes are not counted.
+`candidate_counts` describe a completed candidate; only `state: succeeded`
+with `published_synced_at` confirms publication. Failures preserve the valid
+replica and record a sanitized error category and reason, without raw responses,
+request URLs, or credentials. Analysis fallback warnings include that reason.
+
+The sidecar is the most recently reported attempt, not a historical ledger or
+a process-liveness guarantee. An interrupted process can leave `state: running`;
+inspect `observed_at`. Diagnostic write failures issue a warning but do not
+invalidate synchronization or replace its authoritative result.
 
 The Local replica uses the operating system's application-data directory.
 Set `HYFA_STATE_DIR` to isolate it, for example in CI. `HYFA_GITHUB_API_URL`

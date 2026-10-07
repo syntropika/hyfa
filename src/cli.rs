@@ -133,13 +133,58 @@ fn refresh_for_relationships(
     repository: &Repository,
     requested: &[String],
 ) -> Result<(LocalReplica, ReplicaSource), CliError> {
-    let refresh = github_client()
+    let refresh = github_client_for_sync(repository)
         .and_then(|client| synchronize_with_relationships(repository, &client, requested));
     refresh_or_local_after(repository, refresh)
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Search effective local Issue titles, bodies, and comments.
+    Search {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        query: String,
+        #[command(flatten)]
+        filters: crate::discovery::Filters,
+        /// Maximum results; all matches are counted before truncation.
+        #[arg(long, default_value = "20", value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+        /// Attempt a pull-only synchronization before local discovery.
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Suggest related Issues using explicit references and shared title terms.
+    Related {
+        /// Issue in OWNER/REPO#NUMBER or draft-reference form.
+        issue: String,
+        #[command(flatten)]
+        filters: crate::discovery::Filters,
+        #[arg(long, default_value = "20", value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect the last synchronization attempt and valid local snapshot without network access.
+    Status {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read GitHub-linked closing PRs as separate, cached context.
+    Prs {
+        issue: String,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Read an Issue's complete effective local content, comments, and relationships.
     View {
         /// Issue in OWNER/REPO#NUMBER or draft-reference form.
@@ -147,6 +192,9 @@ enum Command {
         /// Read the last valid snapshot without attempting a GitHub refresh.
         #[arg(long)]
         offline: bool,
+        /// Include separately observed GitHub-linked closing PR context.
+        #[arg(long)]
+        with_prs: bool,
         /// Emit versioned machine-readable output.
         #[arg(long)]
         json: bool,
@@ -437,11 +485,51 @@ impl From<IssueStateArgument> for IssueStateValue {
 pub(crate) fn execute() -> Result<(), CliError> {
     let cli = Cli::parse();
     match cli.command {
-        Command::View {
+        Command::Search {
+            repo,
+            query,
+            filters,
+            limit,
+            refresh,
+            json,
+        } => discover(
+            &Repository::parse(&repo)?,
+            DiscoveryRequest::Search(&query),
+            &filters,
+            usize::from(limit),
+            refresh,
+            json,
+        ),
+        Command::Related {
+            issue,
+            filters,
+            limit,
+            refresh,
+            json,
+        } => {
+            let reference = PendingIssueReference::parse(&issue)?;
+            let resolved = crate::draft_identity::resolve_reference(&reference)?;
+            discover(
+                reference.repository(),
+                DiscoveryRequest::Related(&resolved),
+                &filters,
+                usize::from(limit),
+                refresh,
+                json,
+            )
+        }
+        Command::Status { repo, json } => sync_status(&Repository::parse(&repo)?, json),
+        Command::Prs {
             issue,
             offline,
             json,
-        } => view_issue(&issue, offline, json),
+        } => linked_prs(&issue, offline, json),
+        Command::View {
+            issue,
+            offline,
+            with_prs,
+            json,
+        } => view_issue(&issue, offline, with_prs, json),
         Command::Auth { command } => crate::auth::execute(command).map_err(Into::into),
         Command::Skill { command } => crate::skill::execute(command).map_err(Into::into),
         Command::Create {
@@ -546,7 +634,173 @@ pub(crate) fn execute() -> Result<(), CliError> {
     }
 }
 
-fn view_issue(value: &str, offline: bool, json: bool) -> Result<(), CliError> {
+enum DiscoveryRequest<'a> {
+    Search(&'a str),
+    Related(&'a PendingIssueReference),
+}
+
+fn discover(
+    repository: &Repository,
+    request: DiscoveryRequest<'_>,
+    filters: &crate::discovery::Filters,
+    limit: usize,
+    refresh: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    if let DiscoveryRequest::Search(query) = &request {
+        crate::discovery::validate_query(query)?;
+    }
+    let (replica, source) = if refresh {
+        let (replica, source) = refresh_for_relationships(repository, &[])?;
+        (
+            replica,
+            if source.is_fallback() {
+                "local_fallback"
+            } else {
+                "live"
+            },
+        )
+    } else {
+        (
+            ReplicaStore::discover(repository)?.load(repository)?,
+            "local",
+        )
+    };
+    let outbox = OutboxStore::discover(repository)?.load(repository)?;
+    let working = WorkingGraph::project(&replica, &outbox)?;
+    let subject_provenance = match &request {
+        DiscoveryRequest::Related(reference) => {
+            Some(working.provenance_for_issue(reference.local_number()))
+        }
+        DiscoveryRequest::Search(_) => None,
+    };
+    let (command, schema, method, query, subject, results) = match request {
+        DiscoveryRequest::Search(query) => (
+            "search",
+            "hyfa.search/v1",
+            "keyword/v1",
+            Some(query),
+            None,
+            crate::discovery::search(&working, query, filters, limit)?,
+        ),
+        DiscoveryRequest::Related(reference) => (
+            "related",
+            "hyfa.related/v1",
+            "references-and-title-terms/v1",
+            None,
+            Some(reference.stable_key()),
+            crate::discovery::related(&working, reference.local_number(), filters, limit)?,
+        ),
+    };
+    let output = serde_json::json!({
+        "schema_version": schema, "command": command, "method": method,
+        "repository": replica.repository, "source": source, "synced_at": replica.synced_at,
+        "replica_snapshot_hash": replica.input_hash, "input_hash": working.input_hash(),
+        "pending": working.is_pending(), "pending_operation_ids": working.operation_ids(),
+        "query": query, "subject": subject, "subject_provenance": subject_provenance,
+        "filters": filters, "results": results,
+    });
+    if json {
+        serde_json::to_writer(std::io::stdout().lock(), &output).map_err(CliError::EncodeOutput)?;
+        println!();
+    } else {
+        println!(
+            "{} in {} (source {}, synced_at {}):",
+            command, replica.repository, source, replica.synced_at
+        );
+        for hit in &results.hits {
+            hit.print();
+        }
+        println!(
+            "{} matches; showing {}",
+            results.matched_count(),
+            results.hits.len()
+        );
+    }
+    Ok(())
+}
+
+fn sync_status(repository: &Repository, json: bool) -> Result<(), CliError> {
+    let store = ReplicaStore::discover(repository)?;
+    let (replica, snapshot_state) = match store.load(repository) {
+        Ok(replica) => (Some(replica), "valid"),
+        Err(StoreError::MissingReplica) => (None, "missing"),
+        Err(StoreError::Decode(_) | StoreError::InvalidReplica(_)) => (None, "invalid"),
+        Err(error) => return Err(error.into()),
+    };
+    let attempt = crate::sync_diagnostics::load(repository)?;
+    let outbox = OutboxStore::discover(repository)?.load(repository)?;
+    let output = serde_json::json!({
+        "schema_version": "hyfa.status/v1", "command": "status", "repository": repository.full_name(),
+        "snapshot": replica.as_ref().map(snapshot_summary), "snapshot_state": snapshot_state,
+        "last_attempt": attempt,
+        "pending_operation_count": outbox.operations().len(),
+    });
+    if json {
+        serde_json::to_writer(std::io::stdout().lock(), &output).map_err(CliError::EncodeOutput)?;
+        println!();
+    } else {
+        if let Some(replica) = &replica {
+            println!(
+                "{}: valid Local replica synchronized at {}",
+                repository.full_name(),
+                replica.synced_at
+            );
+            let counts = snapshot_summary(replica);
+            println!(
+                "{} Issues, {} comments, {} Dependencies",
+                counts.issue_count, counts.comment_count, counts.dependency_count
+            );
+        } else {
+            println!(
+                "{}: no valid Local replica ({})",
+                repository.full_name(),
+                snapshot_state
+            );
+        }
+        if let Some(attempt) = &attempt {
+            attempt.print();
+        } else {
+            println!("No recorded synchronization attempt.");
+        }
+        println!("Pending mutations: {}", outbox.operations().len());
+    }
+    Ok(())
+}
+
+fn pr_context(
+    reference: &PendingIssueReference,
+    offline: bool,
+) -> Result<crate::pull_requests::Context, CliError> {
+    let Some(issue) = reference.as_github() else {
+        return Ok(crate::pull_requests::Context::draft());
+    };
+    if offline {
+        return crate::pull_requests::read(issue, None).map_err(Into::into);
+    }
+    let client = github_client();
+    let refresh = client.as_ref().map_err(sync_failure);
+    crate::pull_requests::read(issue, Some(refresh)).map_err(Into::into)
+}
+
+fn linked_prs(value: &str, offline: bool, json: bool) -> Result<(), CliError> {
+    let reference = PendingIssueReference::parse(value)?;
+    let resolved = crate::draft_identity::resolve_reference(&reference)?;
+    let context = pr_context(&resolved, offline)?;
+    if json {
+        let output = serde_json::json!({
+            "schema_version": "hyfa.pull-requests/v1", "command": "prs", "repository": reference.repository().full_name(),
+            "issue": resolved.stable_key(), "context": context,
+        });
+        serde_json::to_writer(std::io::stdout().lock(), &output).map_err(CliError::EncodeOutput)?;
+        println!();
+    } else {
+        context.print();
+    }
+    Ok(())
+}
+
+fn view_issue(value: &str, offline: bool, with_prs: bool, json: bool) -> Result<(), CliError> {
     let reference = PendingIssueReference::parse(value)?;
     let resolved = crate::draft_identity::resolve_reference(&reference)?;
     let repository = reference.repository();
@@ -570,13 +824,20 @@ fn view_issue(value: &str, offline: bool, json: bool) -> Result<(), CliError> {
     let outbox = OutboxStore::discover(repository)?.load(repository)?;
     let working = WorkingGraph::project(&replica, &outbox)?;
     let issue = crate::issue_read::read(&working, resolved.local_number())?;
+    let prs = with_prs
+        .then(|| pr_context(&resolved, offline))
+        .transpose()?;
     if json {
-        let output = serde_json::json!({
+        let mut output = serde_json::json!({
             "schema_version": "hyfa.issue-view/v1", "command": "view", "repository": replica.repository,
             "source": source, "synced_at": replica.synced_at, "replica_snapshot_hash": replica.input_hash,
             "input_hash": working.input_hash(), "pending": working.is_pending(), "pending_operation_ids": working.operation_ids(),
             "issue": issue,
         });
+        if let Some(prs) = &prs {
+            output["pull_request_context"] =
+                serde_json::to_value(prs).map_err(CliError::EncodeOutput)?;
+        }
         serde_json::to_writer(std::io::stdout().lock(), &output).map_err(CliError::EncodeOutput)?;
         println!();
     } else {
@@ -584,6 +845,9 @@ fn view_issue(value: &str, offline: bool, json: bool) -> Result<(), CliError> {
             "{} {}\nState: {}\nSource: {} (synced_at {})",
             issue.key, issue.title, issue.state, source, replica.synced_at
         );
+        if let Some(prs) = &prs {
+            prs.print();
+        }
         println!(
             "Assignees: {}\nLabels: {}",
             issue.assignees.join(", "),
@@ -1573,7 +1837,7 @@ fn next(
 }
 
 fn synchronize(repository: &Repository) -> Result<LocalReplica, CliError> {
-    let client = github_client()?;
+    let client = github_client_for_sync(repository)?;
     synchronize_with_client(repository, &client)
 }
 
@@ -1589,6 +1853,24 @@ fn synchronize_with_relationships(
     client: &GitHubClient,
     requested: &[String],
 ) -> Result<LocalReplica, CliError> {
+    let journal = crate::sync_diagnostics::Journal::begin(
+        repository,
+        crate::sync_diagnostics::Stage::Refreshing,
+    )?;
+    let observer = journal.clone();
+    client.observe_pages(Some(Box::new(move |items| observer.page(items))));
+    let result = synchronize_observed(repository, client, requested, &journal);
+    client.observe_pages(None);
+    journal.finish(result.as_ref().map_err(sync_failure));
+    result
+}
+
+fn synchronize_observed(
+    repository: &Repository,
+    client: &GitHubClient,
+    requested: &[String],
+    journal: &crate::sync_diagnostics::Journal,
+) -> Result<LocalReplica, CliError> {
     let store = ReplicaStore::discover(repository)?;
     let previous = match store.load(repository) {
         Ok(replica) => Some(replica),
@@ -1599,8 +1881,44 @@ fn synchronize_with_relationships(
     };
     let replica =
         replica_sync::refresh_with_relationships(client, repository, previous.as_ref(), requested)?;
+    journal.stage(crate::sync_diagnostics::Stage::Validating, Some(&replica));
+    replica.validate(repository.full_name())?;
+    journal.stage(crate::sync_diagnostics::Stage::Publishing, None);
     store.publish(&replica)?;
     Ok(replica)
+}
+
+fn github_client_for_sync(repository: &Repository) -> Result<GitHubClient, CliError> {
+    // Reject unsafe configuration before creating any local state.
+    api_base_url()?;
+    let journal = crate::sync_diagnostics::Journal::begin(
+        repository,
+        crate::sync_diagnostics::Stage::Connecting,
+    )?;
+    let result = github_client();
+    if let Err(error) = &result {
+        journal.finish(Err(sync_failure(error)));
+    }
+    result
+}
+
+fn sync_failure(error: &CliError) -> crate::sync_diagnostics::Failure {
+    use crate::sync_diagnostics::Failure;
+    match error {
+        CliError::Auth(_) => Failure::new("authentication", "GitHub credentials are unavailable"),
+        CliError::GitHub(error) | CliError::ReplicaSync(ReplicaSyncError::GitHub(error)) => {
+            Failure::github(error)
+        }
+        CliError::Store(_) | CliError::ReplicaSync(ReplicaSyncError::Store(_)) => Failure::new(
+            "persistence",
+            "Could not read or publish local synchronization state",
+        ),
+        CliError::Replica(_) | CliError::ReplicaSync(ReplicaSyncError::Replica(_)) => Failure::new(
+            "invalid_replica",
+            "The synchronization candidate did not pass validation",
+        ),
+        _ => Failure::new("configuration", "Could not initialize synchronization"),
+    }
 }
 
 fn github_client() -> Result<GitHubClient, CliError> {
@@ -1916,7 +2234,15 @@ fn analysis_warnings(working: &WorkingGraph<'_>, source: ReplicaSource) -> Vec<R
             });
         }
     }
-    if let Some(warning) = source.warning() {
+    if let Some(mut warning) = source.warning() {
+        if let Ok(repository) = Repository::parse(&replica.repository)
+            && let Ok(Some(attempt)) = crate::sync_diagnostics::load(&repository)
+            && let Some(failure) = attempt.failure
+        {
+            warning
+                .message
+                .push_str(&format!("; {} ({})", failure.message, failure.code));
+        }
         warnings.push(warning);
     }
     warnings
@@ -2514,6 +2840,12 @@ impl ReplicaSource {
 
 #[derive(Debug, Error)]
 pub(crate) enum CliError {
+    #[error(transparent)]
+    Discovery(#[from] crate::discovery::DiscoveryError),
+    #[error(transparent)]
+    SyncDiagnostics(#[from] crate::sync_diagnostics::DiagnosticsError),
+    #[error(transparent)]
+    PullRequestContext(#[from] crate::pull_requests::ContextError),
     #[error(transparent)]
     IssueRead(#[from] crate::issue_read::IssueReadError),
     #[error(transparent)]

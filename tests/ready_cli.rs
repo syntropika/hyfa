@@ -121,7 +121,7 @@ fn ready_falls_back_to_the_latest_valid_replica_without_advancing_synced_at() {
     assert_eq!(offline["warnings"][0]["code"], "offline_fallback");
     assert_eq!(
         offline["warnings"][0]["message"],
-        "GitHub refresh failed; using the latest valid Local replica"
+        "GitHub refresh failed; using the latest valid Local replica; GitHub credentials are unavailable (authentication)"
     );
 }
 
