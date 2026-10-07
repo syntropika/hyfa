@@ -84,6 +84,30 @@ counts as exact. Blocked subjects have no immediate-outcome claim, and chain
 depth is unavailable for reachable cycles. These are structural diagnostics,
 not business value, delivery estimates, or additional ranking weights.
 
+## Discover context
+
+Before creating an Issue, search the effective local content and inspect related
+work. `search` and `related` read locally unless `--refresh` is passed; `status`
+always reads locally. Online `view --with-prs` fetches Issue and PR context;
+`prs --offline` reads only its saved context:
+
+```bash
+hyfa search --repo OWNER/REPO --query 'manifest cache' --json
+hyfa related 'OWNER/REPO#42' --json
+hyfa status --repo OWNER/REPO --json
+hyfa view 'OWNER/REPO#42' --with-prs --json
+hyfa prs 'OWNER/REPO#42' --offline --json
+```
+
+Search includes title, body, and comments, including pending changes and Drafts.
+Check result truncation, evidence, snapshot time, and pending provenance. Related
+work is a suggestion, not a confirmed duplicate or native Dependency. Discovery
+may include closed or blocked Issues; choose executable work through `ready`
+and `next`. Linked PR context has its own observation time and completeness;
+null PR data is unknown, not proof that no PR exists. Status reports the last
+sync attempt and sanitized fallback reason; received pages are not publication
+evidence. These commands never replay the outbox or merge PRs.
+
 ## Make authorized changes
 
 `update` changes exactly one logical field per invocation. Repeated

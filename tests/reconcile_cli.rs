@@ -1,3 +1,5 @@
+mod support;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -429,6 +431,15 @@ fn accepted_writes_are_checkpointed_and_not_replayed_after_final_sync_failure() 
         &["reconcile", "--repo", "acme/reconcile", "--json"],
     );
     assert!(!interrupted.status.success());
+    let diagnostic = support::synchronization_status(&state, "acme/reconcile");
+    assert_eq!(diagnostic["last_attempt"]["state"], "failed");
+    assert_eq!(diagnostic["last_attempt"]["stage"], "refreshing");
+    assert_eq!(
+        diagnostic["last_attempt"]["failure"]["code"],
+        "github_status"
+    );
+    assert!(diagnostic["last_attempt"]["published_synced_at"].is_null());
+
     let outbox: Value =
         serde_json::from_slice(&fs::read(outbox_path(&state)).expect("checkpointed outbox"))
             .expect("outbox JSON");

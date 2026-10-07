@@ -109,10 +109,8 @@ pub(crate) fn update(
 
     let issue_url = readback.url.clone();
     let issue_number = readback.number;
-    let store = ReplicaStore::discover(issue.repository())
-        .map_err(|source| publication_error(remote_changed, source))?;
-    store
-        .publish(&replica)
+    let replica = replica
+        .publish()
         .map_err(|source| publication_error(remote_changed, source))?;
 
     Ok(PriorityUpdateResult {

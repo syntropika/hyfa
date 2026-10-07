@@ -70,8 +70,7 @@ pub(crate) fn update_or_queue(
     {
         match apply_online(client, &resolved) {
             Ok(change) => {
-                let replica = synchronize_and_verify(client, &repository, &resolved)?;
-                ReplicaStore::discover(&repository)?.publish(&replica)?;
+                let replica = synchronize_and_verify(client, &repository, &resolved)?.publish()?;
                 return Ok(MetadataMutationResult {
                     target,
                     desired: resolved.desired(),
@@ -263,7 +262,7 @@ fn synchronize_and_verify(
     client: &GitHubClient,
     repository: &Repository,
     request: &ResolvedMetadataRequest,
-) -> Result<LocalReplica, MetadataMutationError> {
+) -> Result<replica_sync::RefreshedReplica, MetadataMutationError> {
     let replica = replica_sync::fetch(client, repository)?;
     let verified = match request {
         ResolvedMetadataRequest::GenericLabel {

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Search effective Issue titles, bodies, and comments locally with `hyfa search`,
+  including pending edits and Drafts, with filters, evidence snippets, and JSON.
+- Suggest related Issues with `hyfa related` using explicit references and shared
+  title terms, without changing native Dependencies or operational ranking.
+- Inspect offline synchronization status, phase progress, received-page counters,
+  and sanitized failure reasons with `hyfa status`. Failed refreshes retain the
+  preceding valid replica and synchronization time.
+- Inspect GitHub-linked closing PRs through `hyfa prs` or `hyfa view --with-prs`,
+  including open, closed, merged, and Draft state. Complete observations are
+  cached privately and remain readable offline with their own observation time.
+
 ## 0.4.0
 
 - Explain Dependency impact in `hyfa view` and the private graph's Issue details:

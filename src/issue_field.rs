@@ -279,15 +279,13 @@ fn update_online(
         });
     }
     let issue_url = readback.url.clone();
-    ReplicaStore::discover(issue.repository())?
-        .publish(&replica)
-        .map_err(|source| {
-            if remote_changed {
-                IssueFieldUpdateError::PublicationAfterMutation(source)
-            } else {
-                IssueFieldUpdateError::Store(source)
-            }
-        })?;
+    let replica = replica.publish().map_err(|source| {
+        if remote_changed {
+            IssueFieldUpdateError::PublicationAfterMutation(source)
+        } else {
+            IssueFieldUpdateError::Store(source)
+        }
+    })?;
     Ok(IssueFieldUpdateResult {
         issue_key: issue.stable_key(),
         issue_number: issue.number(),

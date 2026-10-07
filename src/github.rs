@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet, HashSet},
+};
 
 use reqwest::{
     StatusCode,
@@ -29,7 +32,10 @@ const API_VERSION: &str = "2026-03-10";
 pub(crate) struct GitHubClient {
     client: Client,
     base_url: Url,
+    page_observer: RefCell<Option<PageObserver>>,
 }
+
+type PageObserver = Box<dyn FnMut(usize)>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CreatedIssueIdentity {
@@ -132,7 +138,86 @@ impl GitHubClient {
             .build()
             .map_err(GitHubError::BuildClient)?;
 
-        Ok(Self { client, base_url })
+        Ok(Self {
+            client,
+            base_url,
+            page_observer: RefCell::new(None),
+        })
+    }
+
+    pub(crate) fn observe_pages(&self, observer: Option<PageObserver>) {
+        *self.page_observer.borrow_mut() = observer;
+    }
+
+    pub(crate) fn fetch_linked_pull_requests(
+        &self,
+        issue: &IssueReference,
+    ) -> Result<Vec<crate::pull_requests::PullRequest>, GitHubError> {
+        let number =
+            i32::try_from(issue.number()).map_err(|_| GitHubError::InvalidPullRequestContext)?;
+        let mut cursor: Option<String> = None;
+        let mut cursors = BTreeSet::new();
+        let mut results = BTreeMap::new();
+        let mut expected_count = None;
+        loop {
+            let response = self.client.post(self.graphql_endpoint()).json(&json!({
+                "query": "query LinkedPullRequests($owner: String!, $name: String!, $number: Int!, $cursor: String) { repository(owner: $owner, name: $name) { issue(number: $number) { number closedByPullRequestsReferences(first: 100, after: $cursor, includeClosedPrs: true) { totalCount nodes { number title state isDraft url updatedAt mergedAt repository { nameWithOwner } } pageInfo { hasNextPage endCursor } } } } }",
+                "variables": { "owner": issue.repository().owner(), "name": issue.repository().name(), "number": number, "cursor": cursor }
+            })).send().map_err(GitHubError::Request)?;
+            if !response.status().is_success() {
+                return Err(api_status_error(response.status(), response.headers()));
+            }
+            let payload: LinkedPrResponse = response.json().map_err(GitHubError::Decode)?;
+            if !payload.errors.is_empty() {
+                return Err(GitHubError::InvalidPullRequestContext);
+            }
+            let remote = payload
+                .data
+                .and_then(|data| data.repository)
+                .and_then(|repo| repo.issue)
+                .ok_or(GitHubError::InvalidPullRequestContext)?;
+            if remote.number != issue.number() {
+                return Err(GitHubError::IssueIdentityMismatch);
+            }
+            let connection = remote
+                .closed_by_pull_requests_references
+                .ok_or(GitHubError::InvalidPullRequestContext)?;
+            if expected_count.is_some_and(|count| count != connection.total_count) {
+                return Err(GitHubError::InvalidPullRequestContext);
+            }
+            expected_count = Some(connection.total_count);
+            let empty = connection.nodes.is_empty();
+            for node in connection.nodes {
+                let pr = node
+                    .ok_or(GitHubError::InvalidPullRequestContext)?
+                    .normalize()?;
+                if results.insert(pr.key.to_ascii_lowercase(), pr).is_some() {
+                    return Err(GitHubError::InvalidPullRequestContext);
+                }
+            }
+            if results.len() > connection.total_count
+                || (connection.page_info.has_next_page && results.len() == connection.total_count)
+            {
+                return Err(GitHubError::InvalidPullRequestContext);
+            }
+            if !connection.page_info.has_next_page {
+                if results.len() != connection.total_count {
+                    return Err(GitHubError::InvalidPullRequestContext);
+                }
+                let mut prs: Vec<_> = results.into_values().collect();
+                prs.sort_by(|a, b| a.key.cmp(&b.key));
+                return Ok(prs);
+            }
+            let next = connection
+                .page_info
+                .end_cursor
+                .filter(|cursor| !cursor.is_empty())
+                .ok_or(GitHubError::InvalidPullRequestContext)?;
+            if empty || !cursors.insert(next.clone()) {
+                return Err(GitHubError::PaginationLoop);
+            }
+            cursor = Some(next);
+        }
     }
 
     pub(crate) fn fetch_all_issues(
@@ -1193,7 +1278,10 @@ impl GitHubClient {
         }
 
         let next = next_link(response.headers())?;
-        let page = response.json().map_err(GitHubError::Decode)?;
+        let page: Vec<T> = response.json().map_err(GitHubError::Decode)?;
+        if let Some(observer) = self.page_observer.borrow_mut().as_mut() {
+            observer(page.len());
+        }
         Ok((page, next))
     }
 
@@ -1229,6 +1317,45 @@ impl GitHubClient {
 pub(crate) enum ConditionalPages<T> {
     NotModified,
     Modified(CompletePages<T>),
+}
+
+#[derive(Deserialize)]
+struct LinkedPrResponse {
+    data: Option<LinkedPrData>,
+    #[serde(default)]
+    errors: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct LinkedPrData {
+    repository: Option<LinkedPrRepository>,
+}
+
+#[derive(Deserialize)]
+struct LinkedPrRepository {
+    issue: Option<LinkedPrIssue>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinkedPrIssue {
+    number: u64,
+    closed_by_pull_requests_references: Option<LinkedPrConnection>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinkedPrConnection {
+    total_count: usize,
+    nodes: Vec<Option<crate::pull_requests::RawPullRequest>>,
+    page_info: LinkedPrPageInfo,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinkedPrPageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
 }
 
 #[derive(Eq, PartialEq)]
@@ -1712,6 +1839,8 @@ struct SubIssueRequest {
 
 #[derive(Debug, Error)]
 pub(crate) enum GitHubError {
+    #[error("GitHub returned invalid or incomplete linked PR context")]
+    InvalidPullRequestContext,
     #[error("GitHub returned an invalid or incomplete Issue relationship inventory")]
     InvalidRelationship,
     #[error("the GitHub token cannot be represented as an HTTP header")]
@@ -1794,6 +1923,7 @@ impl GitHubError {
             | Self::InvalidUrl { .. }
             | Self::InvalidRepositoryUrl
             | Self::InvalidRelationship
+            | Self::InvalidPullRequestContext
             | Self::InvalidLabelUrl
             | Self::IssueIdentityMismatch
             | Self::InvalidIssueFieldValue

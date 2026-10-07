@@ -1,3 +1,5 @@
+mod support;
+
 use std::{fs, path::Path, process::Command};
 
 use mockito::{Matcher, Mock, Server};
@@ -159,22 +161,28 @@ fn update_reports_when_github_changed_but_synchronization_failed() {
     current.assert();
     addition.assert();
     failed_sync.assert();
+    let diagnostic = support::synchronization_status(&state, "acme/widgets");
+    assert_eq!(diagnostic["last_attempt"]["state"], "failed");
+    assert_eq!(diagnostic["last_attempt"]["stage"], "refreshing");
+    assert_eq!(
+        diagnostic["last_attempt"]["failure"]["code"],
+        "github_status"
+    );
+    assert!(diagnostic["last_attempt"]["published_synced_at"].is_null());
 }
 
 #[test]
 fn update_reports_when_github_changed_but_replica_publication_failed() {
     let mut github = Server::new();
-    let workspace = TempDir::new().expect("temporary workspace");
-    let invalid_state = workspace.path().join("state-file");
-    fs::create_dir(&invalid_state).expect("initial state directory");
+    let state = TempDir::new().expect("temporary state directory");
     let before = issue(7, vec![label(10, "area:core")]);
     let after = issue(7, vec![label(10, "area:core"), label(23, "priority:p3")]);
     let current = mock_current_issue(&mut github, before);
     let addition = mock_priority_addition(&mut github, "priority:p3", 200);
     let synchronization =
-        mock_synchronization_with_failure(&mut github, after, Some(invalid_state.clone()));
+        mock_synchronization_with_failure(&mut github, after, Some(state.path().to_path_buf()));
 
-    let output = update_command_at(&invalid_state, &github.url(), "p3", true)
+    let output = update_command(&state, &github.url(), "p3", true)
         .output()
         .expect("Priority update with failed publication");
     assert!(!output.status.success());
@@ -184,6 +192,11 @@ fn update_reports_when_github_changed_but_replica_publication_failed() {
     current.assert();
     addition.assert();
     synchronization.assert();
+    let diagnostic = support::synchronization_status(&state, "acme/widgets");
+    assert_eq!(diagnostic["last_attempt"]["state"], "failed");
+    assert_eq!(diagnostic["last_attempt"]["stage"], "publishing");
+    assert_eq!(diagnostic["last_attempt"]["failure"]["code"], "persistence");
+    assert!(diagnostic["last_attempt"]["published_synced_at"].is_null());
 }
 
 #[test]
@@ -328,8 +341,8 @@ fn mock_synchronization_with_failure(
         .with_header("content-type", "application/json")
         .with_body_from_request(move |_| {
             if let Some(path) = &fail_publication {
-                fs::remove_dir(path).expect("remove empty fixture directory");
-                fs::write(path, "not a directory").expect("make final publication fail");
+                fs::create_dir_all(path.join("repositories/acme/widgets/replica.json"))
+                    .expect("block replica publication while leaving diagnostics writable");
             }
             b"[]".to_vec()
         })

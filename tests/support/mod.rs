@@ -57,6 +57,19 @@ pub(crate) fn assert_success(output: &std::process::Output) {
     );
 }
 
+pub(crate) fn synchronization_status(state: &TempDir, repository: &str) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_hyfa"))
+        .args(["status", "--repo", repository, "--json"])
+        .env_remove("GH_TOKEN")
+        .env("HYFA_NO_KEYRING", "1")
+        .env("HYFA_STATE_DIR", state.path())
+        .env("HYFA_GITHUB_API_URL", "invalid-url")
+        .output()
+        .expect("offline synchronization status");
+    assert_success(&output);
+    serde_json::from_slice(&output.stdout).expect("status JSON")
+}
+
 pub(crate) fn replica_path(state: &TempDir, repository: &str) -> std::path::PathBuf {
     state
         .path()
