@@ -54,6 +54,25 @@ impl Failure {
         Self::new(code, message)
     }
 
+    pub(crate) fn persistence() -> Self {
+        Self::new(
+            "persistence",
+            "Could not read or publish local synchronization state",
+        )
+    }
+
+    pub(crate) fn synchronization(error: &crate::replica_sync::ReplicaSyncError) -> Self {
+        use crate::replica_sync::ReplicaSyncError;
+        match error {
+            ReplicaSyncError::GitHub(error) => Self::github(error),
+            ReplicaSyncError::Store(_) => Self::persistence(),
+            ReplicaSyncError::Replica(_) => Self::new(
+                "invalid_replica",
+                "The synchronization candidate did not pass validation",
+            ),
+        }
+    }
+
     pub(crate) fn new(code: &str, message: &str) -> Self {
         Self {
             code: code.to_owned(),

@@ -1853,24 +1853,6 @@ fn synchronize_with_relationships(
     client: &GitHubClient,
     requested: &[String],
 ) -> Result<LocalReplica, CliError> {
-    let journal = crate::sync_diagnostics::Journal::begin(
-        repository,
-        crate::sync_diagnostics::Stage::Refreshing,
-    )?;
-    let observer = journal.clone();
-    client.observe_pages(Some(Box::new(move |items| observer.page(items))));
-    let result = synchronize_observed(repository, client, requested, &journal);
-    client.observe_pages(None);
-    journal.finish(result.as_ref().map_err(sync_failure));
-    result
-}
-
-fn synchronize_observed(
-    repository: &Repository,
-    client: &GitHubClient,
-    requested: &[String],
-    journal: &crate::sync_diagnostics::Journal,
-) -> Result<LocalReplica, CliError> {
     let store = ReplicaStore::discover(repository)?;
     let previous = match store.load(repository) {
         Ok(replica) => Some(replica),
@@ -1881,11 +1863,7 @@ fn synchronize_observed(
     };
     let replica =
         replica_sync::refresh_with_relationships(client, repository, previous.as_ref(), requested)?;
-    journal.stage(crate::sync_diagnostics::Stage::Validating, Some(&replica));
-    replica.validate(repository.full_name())?;
-    journal.stage(crate::sync_diagnostics::Stage::Publishing, None);
-    store.publish(&replica)?;
-    Ok(replica)
+    replica.publish().map_err(Into::into)
 }
 
 fn github_client_for_sync(repository: &Repository) -> Result<GitHubClient, CliError> {
@@ -1906,14 +1884,10 @@ fn sync_failure(error: &CliError) -> crate::sync_diagnostics::Failure {
     use crate::sync_diagnostics::Failure;
     match error {
         CliError::Auth(_) => Failure::new("authentication", "GitHub credentials are unavailable"),
-        CliError::GitHub(error) | CliError::ReplicaSync(ReplicaSyncError::GitHub(error)) => {
-            Failure::github(error)
-        }
-        CliError::Store(_) | CliError::ReplicaSync(ReplicaSyncError::Store(_)) => Failure::new(
-            "persistence",
-            "Could not read or publish local synchronization state",
-        ),
-        CliError::Replica(_) | CliError::ReplicaSync(ReplicaSyncError::Replica(_)) => Failure::new(
+        CliError::GitHub(error) => Failure::github(error),
+        CliError::ReplicaSync(error) => Failure::synchronization(error),
+        CliError::Store(_) => Failure::persistence(),
+        CliError::Replica(_) => Failure::new(
             "invalid_replica",
             "The synchronization candidate did not pass validation",
         ),
@@ -1973,9 +1947,8 @@ fn mutate_dependency(
             expected: dependency_expected_relationship(intent),
         });
     }
-    ReplicaStore::discover(github_blocked.repository())
-        .map_err(|source| CliError::MutationPublication { source })?
-        .publish(&replica)
+    let replica = replica
+        .publish()
         .map_err(|source| CliError::MutationPublication { source })?;
 
     let snapshot = snapshot_summary(&replica);

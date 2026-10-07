@@ -16,9 +16,12 @@ missing context remains explicitly unknown. PR context does not enter the Issue
 graph, replica hash, pending outbox, ranking cache, or sealed public export.
 Issue reading may opt into this context without changing its default envelope.
 
-Pull refreshes will report sanitized phase and acquisition diagnostics in an
-independent private sidecar. Diagnostic activity does not prove publication,
-advance cursors or `synced_at`, or authorize remote writes. The valid replica
+All replica refreshes, including mutation readbacks and reconciliation, will
+report sanitized phase and acquisition diagnostics in an independent private
+sidecar. Diagnostic activity does not prove publication,
+advance cursors or `synced_at`, or authorize remote writes. The shared refresh
+and publication lifecycle reports success only after verified publication;
+a discarded candidate is recorded as not published. The valid replica
 remains the only analysis input after a failure. Status reads diagnostics and
 snapshot metadata offline; diagnostic persistence failures remain observable
 warnings rather than failures of an otherwise valid synchronization.

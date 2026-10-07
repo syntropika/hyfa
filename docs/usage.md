@@ -133,15 +133,18 @@ synchronization attempt, the valid snapshot's counts and `synced_at`, and the
 pending-operation count without contacting GitHub. Status uses `hyfa.status/v1`.
 `snapshot_state` distinguishes a valid, missing, or invalid replica; invalid
 replicas have no snapshot summary and cannot become analysis input.
-Pull refreshes record `hyfa.sync-attempt/v1` diagnostics in a separate private
-sidecar, updating phases (`connecting`, `refreshing`, `validating`, `publishing`)
+All replica refreshes, including mutation readbacks and reconciliation, record
+`hyfa.sync-attempt/v1` diagnostics in a separate private sidecar, updating phases (`connecting`, `refreshing`, `validating`, `publishing`)
 and received-page activity through atomic replacement. Pages and items describe
 decoded REST collection activity, including labels and events, rather than
 committed Issues. Conditional 304 responses and GraphQL probes are not counted.
 `candidate_counts` describe a completed candidate; only `state: succeeded`
 with `published_synced_at` confirms publication. Failures preserve the valid
 replica and record a sanitized error category and reason, without raw responses,
-request URLs, or credentials. Analysis fallback warnings include that reason.
+request URLs, or credentials. A candidate rejected by mutation verification
+records `not_published`; reconciliation replaces discarded preflight diagnostics
+with the final refresh attempt. Analysis fallback warnings include the recorded
+reason.
 
 The sidecar is the most recently reported attempt, not a historical ledger or
 a process-liveness guarantee. An interrupted process can leave `state: running`;

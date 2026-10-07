@@ -4,6 +4,10 @@ use mockito::{Matcher, Server};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+#[path = "support/scoped.rs"]
+#[allow(dead_code)]
+mod fixture;
+
 mod support;
 
 fn status(state: &TempDir) -> Value {
@@ -167,4 +171,110 @@ fn status_can_diagnose_an_invalid_replica_without_treating_it_as_a_valid_snapsho
     let diagnostic = status(&state);
     assert_eq!(diagnostic["snapshot_state"], "invalid");
     assert!(diagnostic["snapshot"].is_null());
+}
+
+fn assert_published_status(diagnostic: &Value) {
+    assert_eq!(diagnostic["last_attempt"]["state"], "succeeded");
+    assert_eq!(diagnostic["last_attempt"]["stage"], "publishing");
+    assert_eq!(
+        diagnostic["last_attempt"]["published_synced_at"],
+        diagnostic["snapshot"]["synced_at"]
+    );
+    assert_eq!(
+        diagnostic["last_attempt"]["candidate_counts"]["issue_count"],
+        8
+    );
+    assert!(
+        diagnostic["last_attempt"]["pages_received"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(diagnostic["last_attempt"]["failure"].is_null());
+}
+
+#[test]
+fn priority_update_creates_diagnostics_without_a_previous_sync() {
+    let fixture = fixture::Fixture::new();
+    assert!(status(&fixture.state)["last_attempt"].is_null());
+    let updated = fixture.run(&["update", "acme/widgets#2", "--priority", "p1"], false);
+    let diagnostic = status(&fixture.state);
+    assert_published_status(&diagnostic);
+    assert_eq!(
+        diagnostic["last_attempt"]["published_synced_at"],
+        updated["snapshot"]["synced_at"]
+    );
+}
+
+#[test]
+fn label_update_replaces_stale_sync_diagnostics() {
+    let fixture = fixture::Fixture::new();
+    fixture.run(&["sync", "--repo", "acme/widgets"], false);
+    // A distinct old observation makes the freshness assertion independent of clock resolution.
+    let journal_path = fixture
+        .state
+        .path()
+        .join("repositories/acme/widgets/sync-status.json");
+    let mut previous = status(&fixture.state)["last_attempt"].clone();
+    previous["published_synced_at"] = json!("2020-01-01T00:00:00Z");
+    fs::write(&journal_path, serde_json::to_vec(&previous).unwrap()).unwrap();
+    fixture.run(
+        &["label", "acme/widgets#2", "--add", "area:diagnostics"],
+        false,
+    );
+    let diagnostic = status(&fixture.state);
+    assert_published_status(&diagnostic);
+    assert_ne!(
+        diagnostic["last_attempt"]["published_synced_at"],
+        previous["published_synced_at"]
+    );
+}
+
+#[test]
+fn reconciliation_without_pending_writes_publishes_preflight_diagnostics() {
+    let fixture = fixture::Fixture::new();
+    let reconciled = fixture.run(&["reconcile", "--repo", "acme/widgets"], false);
+    assert_eq!(reconciled["summary"]["remaining"], 0);
+    assert_published_status(&status(&fixture.state));
+}
+
+#[test]
+fn reconciliation_final_refresh_keeps_its_diagnostics_after_discarding_preflight() {
+    let fixture = fixture::Fixture::new();
+    fixture.run(&["sync", "--repo", "acme/widgets"], false);
+    fixture.run(&["update", "acme/widgets#2", "--priority", "p1"], true);
+    let reconciled = fixture.run(&["reconcile", "--repo", "acme/widgets"], false);
+    assert_eq!(reconciled["summary"]["applied"], 1);
+    assert_eq!(reconciled["summary"]["remaining"], 0);
+    let diagnostic = status(&fixture.state);
+    assert_published_status(&diagnostic);
+    assert_eq!(
+        diagnostic["last_attempt"]["published_synced_at"],
+        reconciled["snapshot"]["synced_at"]
+    );
+}
+
+#[test]
+fn diagnostic_write_failure_does_not_prevent_mutation_publication() {
+    let fixture = fixture::Fixture::new();
+    fs::create_dir_all(
+        fixture
+            .state
+            .path()
+            .join("repositories/acme/widgets/sync-status.json"),
+    )
+    .unwrap();
+    let output = fixture
+        .command()
+        .args(["update", "acme/widgets#2", "--priority", "p1", "--json"])
+        .output()
+        .unwrap();
+    support::assert_success(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("could not persist synchronization diagnostics")
+    );
+    let updated: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let replica: Value = serde_json::from_slice(&fixture.snapshot("replica.json")).unwrap();
+    assert_eq!(replica["synced_at"], updated["snapshot"]["synced_at"]);
 }

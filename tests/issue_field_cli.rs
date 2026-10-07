@@ -1,3 +1,5 @@
+mod support;
+
 use std::{
     fs,
     process::Command,
@@ -288,6 +290,12 @@ fn online_field_update_publishes_only_verified_readback() {
     )
     .expect("replica JSON");
     assert_eq!(replica["issues"][0]["title"], "Online title");
+    let diagnostic = support::synchronization_status(&state, "acme/widgets");
+    assert_eq!(diagnostic["last_attempt"]["state"], "succeeded");
+    assert_eq!(
+        diagnostic["last_attempt"]["published_synced_at"],
+        replica["synced_at"]
+    );
 }
 
 #[test]
@@ -374,6 +382,14 @@ fn online_field_update_preserves_the_replica_when_readback_does_not_verify_the_w
     fetch.assert();
     patch.assert();
     inventory.assert();
+    let diagnostic = support::synchronization_status(&state, "acme/widgets");
+    assert_eq!(diagnostic["last_attempt"]["state"], "failed");
+    assert_eq!(diagnostic["last_attempt"]["stage"], "validating");
+    assert_eq!(
+        diagnostic["last_attempt"]["failure"]["code"],
+        "not_published"
+    );
+    assert!(diagnostic["last_attempt"]["published_synced_at"].is_null());
 }
 
 #[test]

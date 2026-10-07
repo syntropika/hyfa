@@ -1,5 +1,8 @@
 use chrono::{SecondsFormat, Utc};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Deref,
+};
 use thiserror::Error;
 
 use crate::{
@@ -7,13 +10,14 @@ use crate::{
     model::{LocalReplica, ReplicaError},
     repository::{PendingIssueReference, Repository},
     store::{ReplicaStore, StoreError},
+    sync_diagnostics::{Failure, Journal, Stage},
     synchronization::refresh_repository,
 };
 
 pub(crate) fn fetch(
     client: &GitHubClient,
     repository: &Repository,
-) -> Result<LocalReplica, ReplicaSyncError> {
+) -> Result<RefreshedReplica, ReplicaSyncError> {
     refresh(client, repository, None)
 }
 
@@ -21,11 +25,86 @@ pub(crate) fn refresh(
     client: &GitHubClient,
     repository: &Repository,
     previous: Option<&LocalReplica>,
-) -> Result<LocalReplica, ReplicaSyncError> {
+) -> Result<RefreshedReplica, ReplicaSyncError> {
     refresh_with_relationships(client, repository, previous, &[])
 }
 
 pub(crate) fn refresh_with_relationships(
+    client: &GitHubClient,
+    repository: &Repository,
+    previous: Option<&LocalReplica>,
+    requested: &[String],
+) -> Result<RefreshedReplica, ReplicaSyncError> {
+    let journal = Journal::begin(repository, Stage::Refreshing)?;
+    let observer = journal.clone();
+    client.observe_pages(Some(Box::new(move |items| observer.page(items))));
+    let result = acquire(client, repository, previous, requested).and_then(|replica| {
+        journal.stage(Stage::Validating, Some(&replica));
+        replica.validate(repository.full_name())?;
+        Ok(replica)
+    });
+    client.observe_pages(None);
+    match result {
+        Ok(replica) => Ok(RefreshedReplica {
+            replica: Some(replica),
+            repository: repository.clone(),
+            journal,
+        }),
+        Err(error) => {
+            journal.finish(Err(Failure::synchronization(&error)));
+            Err(error)
+        }
+    }
+}
+
+// A refresh is successful only after its validated candidate is published.
+pub(crate) struct RefreshedReplica {
+    replica: Option<LocalReplica>,
+    repository: Repository,
+    journal: Journal,
+}
+
+impl RefreshedReplica {
+    pub(crate) fn publish(mut self) -> Result<LocalReplica, StoreError> {
+        let replica = self
+            .replica
+            .take()
+            .expect("unpublished synchronization candidate");
+        self.journal.stage(Stage::Publishing, None);
+        let result =
+            ReplicaStore::discover(&self.repository).and_then(|store| store.publish(&replica));
+        self.journal.finish(
+            result
+                .as_ref()
+                .map(|()| &replica)
+                .map_err(|_| Failure::persistence()),
+        );
+        result.map(|()| replica)
+    }
+}
+
+impl Deref for RefreshedReplica {
+    type Target = LocalReplica;
+
+    fn deref(&self) -> &Self::Target {
+        self.replica
+            .as_ref()
+            .expect("unpublished synchronization candidate")
+    }
+}
+
+impl Drop for RefreshedReplica {
+    fn drop(&mut self) {
+        if self.replica.is_some() {
+            self.journal.finish(Err(Failure::new(
+                "not_published",
+                "The synchronization candidate was not published",
+            )));
+        }
+    }
+}
+
+fn acquire(
     client: &GitHubClient,
     repository: &Repository,
     previous: Option<&LocalReplica>,

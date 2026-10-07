@@ -27,7 +27,7 @@ use crate::{
     priority::{DeclaredPriority, LogicalPriority, PrioritySelection, PriorityState},
     replica_sync::{self, ReplicaSyncError},
     repository::{IssueReference, Repository},
-    store::{ReplicaStore, StoreError},
+    store::StoreError,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -277,13 +277,15 @@ pub(crate) fn reconcile(
     let mut results = pass.operations;
 
     let final_replica = if pass.requires_final_refresh {
+        // Finish the discarded preflight before starting the publication attempt.
+        drop(preflight);
         replica_sync::fetch(client, repository)
             .map_err(ReconciliationError::FinalSynchronization)?
     } else {
         preflight
     };
-    ReplicaStore::discover(repository)?
-        .publish(&final_replica)
+    let final_replica = final_replica
+        .publish()
         .map_err(ReconciliationError::FinalPublication)?;
 
     retire_verified_operations(
